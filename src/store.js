@@ -42,3 +42,6 @@ export function migrateTask(t) {
     completedAt: t.done ? t.completedAt || updated : null,
   };
 }
+
+export const PALETTE = ["#3b5bdb", "#d6336c", "#e8890c", "#2f9e6f", "#7048e8", "#1098ad"];
+export const colorOf = (p) => p.color || PALETTE[[...p.id].reduce((a, c) => a + c.charCodeAt(0), 0) % PALETTE.length];

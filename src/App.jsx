@@ -1,6 +1,8 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocalStorage } from "./useLocalStorage.js";
-import { DEFAULT_PROJECTS, migrateTask, uid } from "./store.js";
+import { DEFAULT_PROJECTS, PALETTE, colorOf, migrateTask, uid } from "./store.js";
+import { DEFAULT_FOCUS, beep, mmss, useTimer } from "./timer.js";
+import Focus from "./Focus.jsx";
 import Sidebar from "./Sidebar.jsx";
 import Today from "./Today.jsx";
 import TaskModal from "./TaskModal.jsx";
@@ -46,12 +48,15 @@ const Icon = {
   list: (
     <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 5h9M7 10h9M7 15h9M3.5 5h.01M3.5 10h.01M3.5 15h.01" /></svg>
   ),
+  play: (
+    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 4.5l8 5.5-8 5.5z" /></svg>
+  ),
   search: (
     <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="9" cy="9" r="5" /><path d="M13 13l4 4" /></svg>
   ),
 };
 
-function TodoItem({ todo, onToggle, onDelete, onSave, onOpen, projectName }) {
+function TodoItem({ todo, onToggle, onDelete, onSave, onOpen, project, onFocus, stat }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(todo.text);
   const today = todayISO();
@@ -102,7 +107,8 @@ function TodoItem({ todo, onToggle, onDelete, onSave, onOpen, projectName }) {
           {todo.subtasks.length > 0 && (
             <span className="due">{todo.subtasks.filter((s) => s.done).length} of {todo.subtasks.length} subtasks</span>
           )}
-          {projectName && <span className="due">{projectName}</span>}
+          {project && <span className="badge" style={{ "--c": colorOf(project) }}>{project.name}</span>}
+          {stat && <span className="due">{stat.n} focus · {stat.min}m</span>}
           {todo.due && (
             <span className={`due ${overdue ? "is-overdue" : ""}`}>
               {overdue ? "Overdue · " : ""}
@@ -113,6 +119,11 @@ function TodoItem({ todo, onToggle, onDelete, onSave, onOpen, projectName }) {
       </div>
 
       <div className="actions">
+        {!todo.done && (
+          <button className="icon-btn" onClick={() => onFocus(todo)} aria-label="Start focus session">
+            {Icon.play}
+          </button>
+        )}
         <button className="icon-btn" onClick={() => onOpen(todo.id)} aria-label="Open task details">
           {Icon.list}
         </button>
@@ -133,6 +144,39 @@ export default function App() {
   const [projects, setProjects] = useLocalStorage("taskdesk.projects", DEFAULT_PROJECTS);
   const [view, setView] = useState("today");
   const [openId, setOpenId] = useState(null);
+  const [cProject, setCProject] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [newName, setNewName] = useState("");
+  const [newColor, setNewColor] = useState(PALETTE[0]);
+  const [toast, setToast] = useState("");
+  const [fs, setFs] = useLocalStorage("taskdesk.focus", DEFAULT_FOCUS);
+  const settings = { ...DEFAULT_FOCUS, ...(fs && typeof fs === "object" ? fs : {}) };
+  const [rawSessions, setSessions] = useLocalStorage("taskdesk.sessions", []);
+  const sessions = useMemo(() => (Array.isArray(rawSessions) ? rawSessions.filter((s) => s && s.id && Number.isFinite(s.completedAt)) : []), [rawSessions]);
+  const addSession = (s) => setSessions((prev) => (Array.isArray(prev) && prev.some((x) => x.id === s.id) ? prev : [...(Array.isArray(prev) ? prev : []), s]));
+  const flash = (m) => { setToast(m); setTimeout(() => setToast(""), 6000); };
+  const notify = (m) => {
+    flash(m);
+    if (settings.sound) beep();
+    if (settings.notify && "Notification" in window && Notification.permission === "granted") {
+      try { new Notification("Taskdesk", { body: m }); } catch { /* optional */ }
+    }
+  };
+  const timer = useTimer({ settings, addSession, notify });
+  useEffect(() => {
+    document.title = timer.active ? `${mmss(timer.remaining)} · Taskdesk` : "Taskdesk";
+  }, [timer.active, Math.ceil(timer.remaining / 1000)]);
+  const stats = useMemo(() => {
+    const m = {};
+    sessions.forEach((s) => {
+      if (s.type === "focus" && s.status === "completed" && s.taskId) {
+        const x = (m[s.taskId] ||= { n: 0, ms: 0 });
+        x.n += 1; x.ms += s.actualMs;
+      }
+    });
+    Object.values(m).forEach((x) => (x.min = Math.round(x.ms / 60000)));
+    return m;
+  }, [sessions]);
   const [theme, setTheme] = useLocalStorage(
     "taskdesk.theme",
     window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light"
@@ -172,7 +216,7 @@ export default function App() {
     setTodos([
       migrateTask({
         id: uid(), text: value, done: false, priority, due: due || null, createdAt: Date.now(),
-        projectId: projects.some((p) => p.id === view) ? view : null,
+        projectId: effProject || null,
       }),
       ...todos,
     ]);
@@ -188,14 +232,35 @@ export default function App() {
 
   const pname = (id) => projects.find((p) => p.id === id)?.name;
   const renderItem = (t) => (
-    <TodoItem key={t.id} todo={t} onToggle={toggle} onDelete={remove} onSave={save} onOpen={setOpenId} projectName={view === "all" ? pname(t.projectId) : null} />
+    <TodoItem key={t.id} todo={t} onToggle={toggle} onDelete={remove} onSave={save} onOpen={setOpenId} project={view === t.projectId ? null : projects.find((p) => p.id === t.projectId)} onFocus={startFocus} stat={stats[t.id]} />
   );
   const openTodo = todos.find((t) => t.id === openId);
-  const addProject = (name) => setProjects([...projects, { id: uid(), name, builtin: false }]);
+  const dupe = (name, except) => projects.find((p) => p.id !== except && p.name.trim().toLowerCase() === name.trim().toLowerCase());
+  const createProject = (name, color) => {
+    const n = name.trim();
+    if (!n) return null;
+    const ex = dupe(n);
+    if (ex) { flash(`“${ex.name}” already exists, selected it instead`); return ex.id; }
+    const id = uid();
+    setProjects([...projects, { id, name: n, builtin: false, color: color || PALETTE[projects.length % PALETTE.length] }]);
+    return id;
+  };
+  const addProject = (name) => { createProject(name); };
+  const setColor = (id, color) => setProjects(projects.map((p) => (p.id === id ? { ...p, color } : p)));
+  const confirmNew = () => {
+    const id = createProject(newName, newColor);
+    if (id) { setCProject(id); setCreating(false); setNewName(""); }
+  };
+  const effProject = cProject && projects.some((p) => p.id === cProject) ? cProject : projects.some((p) => p.id === view) ? view : "";
+  const startFocus = (todo) => {
+    if (timer.active) return flash("Finish or reset the current session first.");
+    timer.setTask(todo);
+    setView("focus");
+  };
   const renameProject = (id) => {
     const cur = projects.find((p) => p.id === id);
     const name = window.prompt("Rename project", cur.name)?.trim();
-    if (name) setProjects(projects.map((p) => (p.id === id ? { ...p, name } : p)));
+    if (name && !dupe(name, id)) setProjects(projects.map((p) => (p.id === id ? { ...p, name } : p)));
   };
   const deleteProject = (id) => {
     const n = todos.filter((t) => t.projectId === id).length;
@@ -219,9 +284,32 @@ export default function App() {
     ? { title: "All caught up", hint: "No open tasks. Add one above." }
     : { title: "No tasks yet", hint: "Type a task above and press Enter to add it." };
 
+  const sidebarEl = <Sidebar projects={projects} todos={todos} view={view} setView={setView} onAdd={addProject} onRename={renameProject} onDelete={deleteProject} onColor={setColor} />;
+  const toastEl = toast && <div className="toast" role="status">{toast}</div>;
+  if (view === "focus") {
+    return (
+      <div className="app">
+        {sidebarEl}
+        <div className="shell">
+          {timer.active && (
+        <div className="mini" role="status">
+          <button className="grow" onClick={() => setView("focus")}>
+            {timer.t.phase === "focus" ? "Focus" : "Break"} <span className="clock-s">{mmss(timer.remaining)}</span>{timer.t.taskTitle ? ` · ${timer.t.taskTitle}` : ""}
+          </button>
+          <button className="btn" onClick={timer.t.status === "running" ? timer.pause : timer.resume}>{timer.t.status === "running" ? "Pause" : "Resume"}</button>
+        </div>
+      )}
+      <header className="top"><div><p className="date">{dateLabel}</p><h1>Focus</h1></div></header>
+          <Focus timer={timer} settings={settings} setSettings={setFs} todos={todos} projects={projects} sessions={sessions}
+            onSelect={(id) => timer.setTask(todos.find((t) => t.id === id) || null)} />
+        </div>
+        {toastEl}
+      </div>
+    );
+  }
   return (
     <div className="app">
-    <Sidebar projects={projects} todos={todos} view={view} setView={setView} onAdd={addProject} onRename={renameProject} onDelete={deleteProject} />
+    {sidebarEl}
     <div className="shell">
       <header className="top">
         <div>
@@ -276,6 +364,16 @@ export default function App() {
               </button>
             ))}
           </div>
+          <select
+            className="date-input"
+            value={effProject}
+            onChange={(e) => (e.target.value === "__new" ? setCreating(true) : setCProject(e.target.value))}
+            aria-label="Project"
+          >
+            <option value="">No project</option>
+            {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+            <option value="__new">+ Create new project…</option>
+          </select>
           <input
             type="date"
             className="date-input"
@@ -286,6 +384,15 @@ export default function App() {
           />
           <button type="submit" className="primary">Add task</button>
         </div>
+        {creating && (
+          <div className="composer-row creator">
+            <input className="date-input grow" autoFocus placeholder="New project name" value={newName} onChange={(e) => setNewName(e.target.value)} aria-label="New project name"
+              onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); confirmNew(); } if (e.key === "Escape") setCreating(false); }} />
+            <input type="color" value={newColor} onChange={(e) => setNewColor(e.target.value)} aria-label="Project color" />
+            <button type="button" className="primary" onClick={confirmNew}>Create project</button>
+            <button type="button" className="btn" onClick={() => setCreating(false)}>Cancel</button>
+          </div>
+        )}
       </form>
 
       {view === "today" ? (
@@ -342,6 +449,7 @@ export default function App() {
           <button className="link" onClick={clearDone}>Clear {done} completed</button>
         </footer>
       )}
+      {toastEl}
       {openTodo && (
         <TaskModal
           todo={openTodo}
